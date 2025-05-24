@@ -1,43 +1,52 @@
 import streamlit as st
 import pandas as pd
-import json
-import os
 import datetime
 from io import BytesIO
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
+from reportlab.lib.utils import simpleSplit
 import base64
 import streamlit.components.v1 as components
+import os
 
-# --- Persistent Files ---
+# --- Persistent Invoice Number File ---
 INVOICE_FILE = "invoice_number.txt"
-QUANTITIES_FILE = "quantities.json"
-INVENTORY_FILE = "inventory.tsv"
 
-# --- Initialize state ---
+# --- Page Configuration ---
+st.set_page_config(page_title="Invoice Manager", layout="centered")
+st.title("📄 Inventory Invoice Manager")
+
+# --- Invoice Number Load/Save ---
+def _load_invoice_number():
+    # Read the latest invoice number from file (or default to 1001)
+    try:
+        with open(INVOICE_FILE, 'r') as f:
+            return int(f.read().strip())
+    except:
+        return 1001
+
+def _save_invoice_number(num):
+    # Atomically write new invoice number
+    with open(INVOICE_FILE, 'w') as f:
+        f.write(str(num))
+
+# --- Session Initialization ---
+# Quantities remain in session only
 if 'quantities' not in st.session_state:
-    if os.path.exists(QUANTITIES_FILE):
-        with open(QUANTITIES_FILE) as f:
-            st.session_state.quantities = json.load(f)
-    else:
-        st.session_state.quantities = {}
-
-if 'invoice_number' not in st.session_state:
-    if os.path.exists(INVOICE_FILE):
-        with open(INVOICE_FILE) as f:
-            st.session_state.invoice_number = int(f.read().strip())
-    else:
-        st.session_state.invoice_number = 1001
+    st.session_state.quantities = {}
 
 # --- Utility functions ---
 def load_inventory():
-    df = pd.read_csv(INVENTORY_FILE, sep='\t')
+    df = pd.read_csv("inventory.tsv", sep='\t')
     df['SKU'] = df['SKU'].astype(str)
-    df['SKU'] = df['SKU'].where(~df['SKU'].duplicated(), df['SKU'] + '_' + df.groupby('SKU').cumcount().astype(str))
+    df['SKU'] = df['SKU'].where(
+        ~df['SKU'].duplicated(),
+        df['SKU'] + '_' + df.groupby('SKU').cumcount().astype(str)
+    )
     return df
 
-def generate_invoice_pdf(df, metadata):
+def generate_invoice_pdf(df, number, metadata):
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
     width, height = LETTER
@@ -46,15 +55,19 @@ def generate_invoice_pdf(df, metadata):
     y = height - margin
     line_height = 14
 
+    # Header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "INVOICE")
     y -= 0.4 * inch
     c.setFont("Helvetica", 10)
-    c.drawString(x, y, f"Invoice #: {metadata['number']}")
+    c.drawString(x, y, f"Invoice #: {number}")
     c.drawString(width - margin - 150, y, f"Date: {metadata['date']}")
     y -= 0.3 * inch
 
+    # Columns
     cols = {'sku': x, 'desc': x+60, 'unit': x+260, 'qty': x+340, 'amount': x+380}
+    desc_max_width = cols['unit'] - cols['desc'] - 4
+
     c.setFont("Helvetica-Bold", 10)
     for label, key in zip(["SKU","Description","Unit Price","Qty","Amount"], cols):
         c.drawString(cols[key], y, label)
@@ -69,17 +82,22 @@ def generate_invoice_pdf(df, metadata):
             continue
         amount = row['Unit Price'] * row['Quantity']
         subtotal += amount
+        desc_lines = simpleSplit(row['Description'], 'Helvetica', 10, desc_max_width)
+        num_lines = len(desc_lines)
+
         c.drawString(cols['sku'], y, row['SKU'])
-        c.drawString(cols['desc'], y, row['Description'])
+        for i, line in enumerate(desc_lines):
+            c.drawString(cols['desc'], y - i * line_height, line)
         c.drawString(cols['unit'], y, f"${row['Unit Price']:.2f}")
         c.drawString(cols['qty'], y, str(row['Quantity']))
         c.drawString(cols['amount'], y, f"${amount:.2f}")
-        y -= line_height
+        y -= (num_lines * line_height) + 4
         if y < margin:
             c.showPage()
             y = height - margin
             c.setFont("Helvetica", 10)
 
+    # Totals
     tax = subtotal * metadata['tax_rate'] / 100
     y -= line_height
     c.drawRightString(width - margin, y, f"Subtotal: ${subtotal:.2f}")
@@ -99,10 +117,6 @@ def generate_invoice_pdf(df, metadata):
     buf.seek(0)
     return buf
 
-# --- Page Configuration ---
-st.set_page_config(page_title="Invoice Manager", layout="centered")
-st.title("📄 Inventory Invoice Manager")
-
 # --- Input Section ---
 with st.expander("Invoice & Customer Details", expanded=True):
     col1, col2 = st.columns(2)
@@ -114,9 +128,8 @@ with st.expander("Invoice & Customer Details", expanded=True):
         upcharge = st.number_input("Upcharge Rate (%)", value=20.0, key="upcharge")
         assembly = st.number_input("Assembly Charge", value=0.0, key="assembly")
         delivery = st.number_input("Delivery Charge", value=0.0, key="delivery")
-        st.write(f"**Invoice #**: {st.session_state.invoice_number}")
 
-# --- Inventory Table & Filters ---
+# --- Inventory & Filters ---
 df = load_inventory()
 df['Unit Price'] = (df['Base Price'] * (1 + upcharge/100)).round(2)
 df['Quantity'] = df['SKU'].map(lambda s: st.session_state.quantities.get(s, 0))
@@ -143,10 +156,8 @@ edited = st.data_editor(
 )
 for sku, qty in zip(edited['SKU'], edited['Quantity']):
     st.session_state.quantities[sku] = int(qty)
-with open(QUANTITIES_FILE, 'w') as f:
-    json.dump(st.session_state.quantities, f)
 
-# --- Totals, Preview & Download PDF ---
+# --- Totals, Preview & Download ---
 sub = sum(edited['Unit Price'] * edited['Quantity'])
 colA, colB = st.columns([2,1])
 with colA:
@@ -154,32 +165,39 @@ with colA:
     st.markdown(f"**Tax:** ${sub * tax_rate/100:.2f}")
     st.markdown(f"**Total:** ${(sub + sub*tax_rate/100 + assembly + delivery):.2f}")
 with colB:
-    # Preview button
     if st.button("📄 Preview Invoice PDF"):
-        pdf_buf = generate_invoice_pdf(edited, {
-            'number': st.session_state.invoice_number,
-            'date': datetime.datetime.now().strftime('%Y-%m-%d'),
-            'tax_rate': tax_rate,
-            'assembly': assembly,
-            'delivery': delivery
-        })
-        # Embed PDF in page
+        number = _load_invoice_number()
+        pdf_buf = generate_invoice_pdf(edited,
+            number,
+            {
+                'date': datetime.datetime.now().strftime('%Y-%m-%d'),
+                'tax_rate': tax_rate,
+                'assembly': assembly,
+                'delivery': delivery
+            }
+        )
         b64 = base64.b64encode(pdf_buf.read()).decode('utf-8')
-        pdf_html = f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="600px"></iframe>'
+        pdf_html = (
+            f'<object data="data:application/pdf;base64,{b64}" type="application/pdf" '
+            'width="100%" height="600px">'
+            f'<p>Preview unavailable. <a href="data:application/pdf;base64,{b64}">Download PDF</a></p>'
+            '</object>'
+        )
         components.html(pdf_html, height=600)
         pdf_buf.seek(0)
-    # Download button
     if st.button("Download Invoice PDF"):
-        pdf = generate_invoice_pdf(edited, {
-            'number': st.session_state.invoice_number,
-            'date': datetime.datetime.now().strftime('%Y-%m-%d'),
-            'tax_rate': tax_rate,
-            'assembly': assembly,
-            'delivery': delivery
-        })
+        number = _load_invoice_number()
+        pdf = generate_invoice_pdf(edited,
+            number,
+            {
+                'date': datetime.datetime.now().strftime('%Y-%m-%d'),
+                'tax_rate': tax_rate,
+                'assembly': assembly,
+                'delivery': delivery
+            }
+        )
+        # increment and save invoice number before download
+        _save_invoice_number(number + 1)
         st.download_button("📥 Save PDF", data=pdf,
-                           file_name=f"invoice_{st.session_state.invoice_number}.pdf",
+                           file_name=f"invoice_{number}.pdf",
                            mime='application/pdf')
-        st.session_state.invoice_number += 1
-        with open(INVOICE_FILE, 'w') as f:
-            f.write(str(st.session_state.invoice_number))
